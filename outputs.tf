@@ -17,3 +17,8 @@ output "s3_bucket_name" {
   description = "S3 log bucket name"
   value       = aws_s3_bucket.logs.bucket
 }
+
+output "monitoring_public_ip" {
+  description = "Monitoring server public IP"
+  value       = aws_instance.monitoring.public_ip
+}

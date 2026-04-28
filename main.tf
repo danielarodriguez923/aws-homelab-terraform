@@ -185,16 +185,6 @@ data "aws_ami" "windows" {
   }
 }
 
-# Bastion EC2
-resource "aws_instance" "bastion" {
-  ami                    = data.aws_ami.amazon_linux.id
-  instance_type          = "t2.micro"
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.bastion.id]
-  key_name               = data.aws_key_pair.homelab.key_name
-
-  tags = { Name = "homelab-bastion" }
-}
 
 # Windows Server EC2
 resource "aws_instance" "windows" {
@@ -308,3 +298,190 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
 
 # Data source for account ID
 data "aws_caller_identity" "current" {}
+
+# Security group for monitoring server
+resource "aws_security_group" "monitoring" {
+  name        = "homelab-monitoring-sg"
+  description = "Prometheus and Grafana monitoring server"
+  vpc_id      = aws_vpc.homelab.id
+
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip]
+  }
+
+  ingress {
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip]
+  }
+
+  ingress {
+    from_port       = 22
+    to_port         = 22
+    protocol        = "tcp"
+    security_groups = [aws_security_group.bastion.id]
+  }
+
+   ingress {
+    from_port   = 9100
+    to_port     = 9100
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "homelab-monitoring-sg" }
+}
+
+
+resource "aws_instance" "monitoring" {
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = "t2.micro"
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.monitoring.id]
+  key_name               = data.aws_key_pair.homelab.key_name
+
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+    yum install -y wget tar
+
+    # Install Prometheus
+    wget https://github.com/prometheus/prometheus/releases/download/v2.51.0/prometheus-2.51.0.linux-amd64.tar.gz
+    tar xvf prometheus-2.51.0.linux-amd64.tar.gz
+    mv prometheus-2.51.0.linux-amd64 /usr/local/prometheus
+
+    # Configure Prometheus
+    cat > /usr/local/prometheus/prometheus.yml << 'PROMEOF'
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - "alert_rules.yml"
+
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      - job_name: 'bastion'
+        static_configs:
+          - targets: ['${aws_instance.bastion.private_ip}:9100']
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            replacement: 'homelab-bastion'
+    PROMEOF
+
+    # Alert rules
+    cat > /usr/local/prometheus/alert_rules.yml << 'ALERTEOF'
+    groups:
+      - name: homelab_alerts
+        rules:
+          - alert: HighCPUUsage
+            expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100) > 80
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High CPU on {{ $labels.instance }}"
+          - alert: InstanceDown
+            expr: up == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "{{ $labels.instance }} is down"
+    ALERTEOF
+
+    # Prometheus systemd service
+    cat > /etc/systemd/system/prometheus.service << 'SVCEOF'
+    [Unit]
+    Description=Prometheus
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=ec2-user
+    ExecStart=/usr/local/prometheus/prometheus \
+      --config.file=/usr/local/prometheus/prometheus.yml \
+      --storage.tsdb.path=/usr/local/prometheus/data
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+    SVCEOF
+
+    # Install Grafana
+    cat > /etc/yum.repos.d/grafana.repo << 'GRAFREPO'
+    [grafana]
+    name=grafana
+    baseurl=https://packages.grafana.com/oss/rpm
+    repo_gpgcheck=1
+    enabled=1
+    gpgcheck=1
+    gpgkey=https://packages.grafana.com/gpg.key
+    sslverify=1
+    sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+    GRAFREPO
+
+    yum install -y grafana
+
+    # Start services
+    systemctl daemon-reload
+    systemctl start prometheus
+    systemctl enable prometheus
+    systemctl start grafana-server
+    systemctl enable grafana-server
+  EOF
+
+  tags = { Name = "homelab-monitoring" }
+}
+
+resource "aws_instance" "bastion" {
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = "t2.micro"
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.bastion.id]
+  key_name               = data.aws_key_pair.homelab.key_name
+
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+    wget https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
+    tar xvf node_exporter-1.7.0.linux-amd64.tar.gz
+    mv node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+
+    cat > /etc/systemd/system/node_exporter.service << 'SVCEOF'
+    [Unit]
+    Description=Node Exporter
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=ec2-user
+    ExecStart=/usr/local/bin/node_exporter
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+    SVCEOF
+
+    systemctl daemon-reload
+    systemctl start node_exporter
+    systemctl enable node_exporter
+  EOF
+
+  tags = { Name = "homelab-bastion" }
+}
