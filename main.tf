@@ -1,12 +1,19 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+  required_version = ">= 1.0"
+}
+
 # VPC
 resource "aws_vpc" "homelab" {
   cidr_block           = var.vpc_cidr
   enable_dns_hostnames = true
   enable_dns_support   = true
-
-  tags = {
-    Name = "homelab-vpc"
-  }
+  tags = { Name = "homelab-vpc" }
 }
 
 # Public subnet
@@ -15,10 +22,7 @@ resource "aws_subnet" "public" {
   cidr_block              = var.public_subnet_cidr
   availability_zone       = var.availability_zone
   map_public_ip_on_launch = true
-
-  tags = {
-    Name = "homelab-public"
-  }
+  tags = { Name = "homelab-public" }
 }
 
 # Private subnet
@@ -26,19 +30,13 @@ resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.homelab.id
   cidr_block        = var.private_subnet_cidr
   availability_zone = var.availability_zone
-
-  tags = {
-    Name = "homelab-private"
-  }
+  tags = { Name = "homelab-private" }
 }
 
 # Internet Gateway
 resource "aws_internet_gateway" "homelab" {
   vpc_id = aws_vpc.homelab.id
-
-  tags = {
-    Name = "homelab-igw"
-  }
+  tags = { Name = "homelab-igw" }
 }
 
 # Elastic IP for NAT Gateway
@@ -50,38 +48,27 @@ resource "aws_eip" "nat" {
 resource "aws_nat_gateway" "homelab" {
   allocation_id = aws_eip.nat.id
   subnet_id     = aws_subnet.public.id
-
-  tags = {
-    Name = "homelab-nat"
-  }
+  tags = { Name = "homelab-nat" }
 }
 
 # Public route table
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.homelab.id
-
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.homelab.id
   }
-
-  tags = {
-    Name = "homelab-public-rt"
-  }
+  tags = { Name = "homelab-public-rt" }
 }
 
 # Private route table
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.homelab.id
-
   route {
     cidr_block     = "0.0.0.0/0"
     nat_gateway_id = aws_nat_gateway.homelab.id
   }
-
-  tags = {
-    Name = "homelab-private-rt"
-  }
+  tags = { Name = "homelab-private-rt" }
 }
 
 # Route table associations
@@ -98,21 +85,23 @@ resource "aws_route_table_association" "private" {
 # Bastion security group
 resource "aws_security_group" "bastion" {
   name        = "homelab-bastion-sg"
-  description = "Bastion host - SSH from my IP only"
+  description = "Bastion host - SSH access"
   vpc_id      = aws_vpc.homelab.id
 
   ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.my_ip]
+    cidr_blocks = [var.my_ip, "52.94.76.0/22", "18.206.107.24/29"]
+    description = "SSH from home IP, CloudShell, and EC2 Instance Connect"
   }
 
   ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["18.206.107.24/29"]
+    from_port       = 9100
+    to_port         = 9100
+    protocol        = "tcp"
+    security_groups = [aws_security_group.monitoring.id]
+    description     = "Node Exporter scraping from monitoring instance"
   }
 
   egress {
@@ -136,6 +125,7 @@ resource "aws_security_group" "windows" {
     to_port         = 3389
     protocol        = "tcp"
     security_groups = [aws_security_group.bastion.id]
+    description     = "RDP from bastion only"
   }
 
   egress {
@@ -148,12 +138,55 @@ resource "aws_security_group" "windows" {
   tags = { Name = "homelab-windows-sg" }
 }
 
-# Reference existing key pair
-data "aws_key_pair" "homelab" {
-  key_name = "homelab-key"
+# Monitoring security group
+resource "aws_security_group" "monitoring" {
+  name        = "homelab-monitoring-sg"
+  description = "Prometheus and Grafana monitoring server"
+  vpc_id      = aws_vpc.homelab.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip, "52.94.76.0/22", "18.206.107.24/29"]
+    description = "SSH from home IP, CloudShell, and EC2 Instance Connect"
+  }
+
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip]
+    description = "Grafana dashboard access"
+  }
+
+  ingress {
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip]
+    description = "Prometheus UI access"
+  }
+
+  ingress {
+    from_port   = 9100
+    to_port     = 9100
+    protocol    = "tcp"
+    cidr_blocks = [var.vpc_cidr]
+    description = "Node Exporter metrics within VPC"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "homelab-monitoring-sg" }
 }
 
-# Get latest Amazon Linux 2 AMI automatically
+# Get latest Amazon Linux 2 AMI
 data "aws_ami" "amazon_linux" {
   most_recent = true
   owners      = ["amazon"]
@@ -169,7 +202,7 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
-# Get latest Windows Server 2022 AMI automatically
+# Get latest Windows Server 2022 AMI
 data "aws_ami" "windows" {
   most_recent = true
   owners      = ["amazon"]
@@ -185,6 +218,51 @@ data "aws_ami" "windows" {
   }
 }
 
+# Reference existing key pair
+data "aws_key_pair" "homelab" {
+  key_name = "homelab-key"
+}
+
+# Account ID for S3 bucket naming
+data "aws_caller_identity" "current" {}
+
+# Bastion EC2
+resource "aws_instance" "bastion" {
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = "t2.micro"
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.bastion.id]
+  key_name               = data.aws_key_pair.homelab.key_name
+
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+    wget https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
+    tar xvf node_exporter-1.7.0.linux-amd64.tar.gz
+    mv node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+
+    cat > /etc/systemd/system/node_exporter.service << 'SVCEOF'
+    [Unit]
+    Description=Node Exporter
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=ec2-user
+    ExecStart=/usr/local/bin/node_exporter
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+    SVCEOF
+
+    systemctl daemon-reload
+    systemctl start node_exporter
+    systemctl enable node_exporter
+  EOF
+
+  tags = { Name = "homelab-bastion" }
+}
 
 # Windows Server EC2
 resource "aws_instance" "windows" {
@@ -198,152 +276,7 @@ resource "aws_instance" "windows" {
   tags = { Name = "homelab-windows" }
 }
 
-# CloudWatch IAM role
-resource "aws_iam_role" "cloudwatch" {
-  name = "homelab-cloudwatch-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
-
-  tags = { Name = "homelab-cloudwatch-role" }
-}
-
-# Attach CloudWatch agent policy
-resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
-  role       = aws_iam_role.cloudwatch.name
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-}
-
-# Custom least-privilege policy for S3 log access
-resource "aws_iam_policy" "ec2_logs" {
-  name = "homelab-ec2-logs-policy"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = ["s3:PutObject", "s3:GetObject"]
-        Resource = "arn:aws:s3:::${aws_s3_bucket.logs.bucket}/logs/*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "cloudwatch:PutMetricData",
-          "logs:PutLogEvents",
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:DescribeLogStreams"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-# Attach custom policy to role
-resource "aws_iam_role_policy_attachment" "ec2_logs" {
-  role       = aws_iam_role.cloudwatch.name
-  policy_arn = aws_iam_policy.ec2_logs.arn
-}
-
-# Instance profile
-resource "aws_iam_instance_profile" "cloudwatch" {
-  name = "homelab-cloudwatch-profile"
-  role = aws_iam_role.cloudwatch.name
-}
-
-
-
-# S3 log bucket
-resource "aws_s3_bucket" "logs" {
-  bucket = "homelab-logs-${data.aws_caller_identity.current.account_id}"
-
-  tags = { Name = "homelab-logs" }
-}
-
-# Block all public access
-resource "aws_s3_bucket_public_access_block" "logs" {
-  bucket = aws_s3_bucket.logs.id
-
-  block_public_acls       = true
-  ignore_public_acls      = true
-  block_public_policy     = true
-  restrict_public_buckets = true
-}
-
-# 30 day lifecycle policy
-resource "aws_s3_bucket_lifecycle_configuration" "logs" {
-  bucket = aws_s3_bucket.logs.id
-
-  rule {
-    id     = "ExpireLogs"
-    status = "Enabled"
-
-    filter {
-      prefix = "logs/"
-    }
-
-    expiration {
-      days = 30
-    }
-  }
-}
-
-# Data source for account ID
-data "aws_caller_identity" "current" {}
-
-# Security group for monitoring server
-resource "aws_security_group" "monitoring" {
-  name        = "homelab-monitoring-sg"
-  description = "Prometheus and Grafana monitoring server"
-  vpc_id      = aws_vpc.homelab.id
-
-  ingress {
-    from_port   = 3000
-    to_port     = 3000
-    protocol    = "tcp"
-    cidr_blocks = [var.my_ip]
-  }
-
-  ingress {
-    from_port   = 9090
-    to_port     = 9090
-    protocol    = "tcp"
-    cidr_blocks = [var.my_ip]
-  }
-
-  ingress {
-    from_port       = 22
-    to_port         = 22
-    protocol        = "tcp"
-    security_groups = [aws_security_group.bastion.id]
-  }
-
-   ingress {
-    from_port   = 9100
-    to_port     = 9100
-    protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "homelab-monitoring-sg" }
-}
-
-
+# Monitoring EC2
 resource "aws_instance" "monitoring" {
   ami                    = data.aws_ami.amazon_linux.id
   instance_type          = "t2.micro"
@@ -438,7 +371,6 @@ resource "aws_instance" "monitoring" {
 
     yum install -y grafana
 
-    # Start services
     systemctl daemon-reload
     systemctl start prometheus
     systemctl enable prometheus
@@ -449,39 +381,96 @@ resource "aws_instance" "monitoring" {
   tags = { Name = "homelab-monitoring" }
 }
 
-resource "aws_instance" "bastion" {
-  ami                    = data.aws_ami.amazon_linux.id
-  instance_type          = "t2.micro"
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.bastion.id]
-  key_name               = data.aws_key_pair.homelab.key_name
+# CloudWatch IAM role
+resource "aws_iam_role" "cloudwatch" {
+  name = "homelab-cloudwatch-role"
 
-  user_data = <<-EOF
-    #!/bin/bash
-    yum update -y
-    wget https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
-    tar xvf node_exporter-1.7.0.linux-amd64.tar.gz
-    mv node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
 
-    cat > /etc/systemd/system/node_exporter.service << 'SVCEOF'
-    [Unit]
-    Description=Node Exporter
-    After=network.target
+  tags = { Name = "homelab-cloudwatch-role" }
+}
 
-    [Service]
-    Type=simple
-    User=ec2-user
-    ExecStart=/usr/local/bin/node_exporter
-    Restart=on-failure
+# Attach CloudWatch agent policy
+resource "aws_iam_role_policy_attachment" "cloudwatch_agent" {
+  role       = aws_iam_role.cloudwatch.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
 
-    [Install]
-    WantedBy=multi-user.target
-    SVCEOF
+# Custom least-privilege policy
+resource "aws_iam_policy" "ec2_logs" {
+  name = "homelab-ec2-logs-policy"
 
-    systemctl daemon-reload
-    systemctl start node_exporter
-    systemctl enable node_exporter
-  EOF
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:GetObject"]
+        Resource = "arn:aws:s3:::${aws_s3_bucket.logs.bucket}/logs/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData",
+          "logs:PutLogEvents",
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
 
-  tags = { Name = "homelab-bastion" }
+# Attach custom policy
+resource "aws_iam_role_policy_attachment" "ec2_logs" {
+  role       = aws_iam_role.cloudwatch.name
+  policy_arn = aws_iam_policy.ec2_logs.arn
+}
+
+# Instance profile
+resource "aws_iam_instance_profile" "cloudwatch" {
+  name = "homelab-cloudwatch-profile"
+  role = aws_iam_role.cloudwatch.name
+}
+
+# S3 log bucket
+resource "aws_s3_bucket" "logs" {
+  bucket = "homelab-logs-${data.aws_caller_identity.current.account_id}"
+  tags = { Name = "homelab-logs" }
+}
+
+# Block public access
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket                  = aws_s3_bucket.logs.id
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = true
+  restrict_public_buckets = true
+}
+
+# 30 day lifecycle policy
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    id     = "ExpireLogs"
+    status = "Enabled"
+
+    filter {
+      prefix = "logs/"
+    }
+
+    expiration {
+      days = 30
+    }
+  }
 }
